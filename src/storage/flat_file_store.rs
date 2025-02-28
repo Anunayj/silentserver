@@ -1,7 +1,6 @@
 use std::fs;
 use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::{BlockData, Index, IndexEntry, StorageError};
@@ -17,6 +16,9 @@ macro_rules! block_file_name {
         format!("sps{:06}.dat", $file_number)
     };
 }
+
+// FlatFileStore stores block data in the following format:
+// [MAGIC_BYTES][Serialized BlockData]* 
 
 /// FlatFileStore manages appending BlockData records into files.
 /// It creates a new file (with a magic header) when MAX_BLOCKDATA_SIZE is reached.
@@ -122,25 +124,243 @@ impl FlatFileStore {
         Ok(())
     }
     
-    /// This is a uninturrpted Buffered Stream of data that can be served to the client
+    /// This is an uninterrupted Buffered Stream of data that can be served to the client
     /// It automatically moves to a new file (skips over magic bytes) when the end of current
-    /// file is reached. 
-    fn get_block_stream_from_offset(&self, entry: &IndexEntry) -> Result<(), StorageError> {
-        todo!();
+    /// file is reached.
+    fn get_block_stream_from_offset<'a>(&'a self, entry: &IndexEntry) -> Result<impl Read + 'a, StorageError> {
+        let file_path = self.block_data_dir.join(&block_file_name!(entry.file_number));
+        let file = File::open(&file_path)?;
+        let reader = BufReader::new(file);
+        
+        // Create a BlockDataReader that will handle reading across file boundaries if needed
+        Ok(BlockDataReader {
+            store: self,
+            current_file_number: entry.file_number,
+            reader,
+            current_position: entry.offset,
+        })
     }
 
-    fn get_block_stream(&self, blockhash: &[u8; 32]) -> Result<(), StorageError> {
+    fn get_block_stream<'a>(&'a self, blockhash: &[u8; 32]) -> Result<impl Read + 'a, StorageError> {
         let entry = self.index.get_block_entry(blockhash)?;
         self.get_block_stream_from_offset(&entry)
     }
 
     /// Just for testing.
-    fn get_block_stream_from_height(&self, height: u32) -> Result<(), StorageError> {
+    fn get_block_stream_from_height<'a>(&'a self, height: u32) -> Result<impl Read + 'a, StorageError> {
         let blockhash = self.index.get_blockhash_by_height(height)?;
         self.get_block_stream(&blockhash)
     }
 
-    fn get_block_stream_from_genesis(&self) -> Result<(), StorageError> {
+    fn get_block_stream_from_genesis<'a>(&'a self) -> Result<impl Read + 'a, StorageError> {
         self.get_block_stream_from_height(0)
+    }
+}
+
+/// A reader that reads block data from flat files, automatically handling file boundaries
+struct BlockDataReader<'a> {
+    store: &'a FlatFileStore,
+    current_file_number: u64,
+    reader: BufReader<File>,
+    current_position: u64,
+}
+
+impl<'a> BlockDataReader<'a> {
+    /// Opens the next file and positions the reader at the start of the data (after magic bytes)
+    fn move_to_next_file(&mut self) -> Result<(), StorageError> {
+        self.current_file_number += 1;
+        let file_path = self.store.block_data_dir.join(&block_file_name!(self.current_file_number));
+        
+        // Check if the next file exists
+        if !file_path.exists() {
+            return Err(StorageError::InvalidData("Next block file does not exist"));
+        }
+        
+        let file = File::open(&file_path)?;
+        self.reader = BufReader::new(file);
+        
+        // Skip the magic bytes at the beginning of the file
+        self.reader.seek(SeekFrom::Start(MAGIC_BYTES.len() as u64))?;
+        self.current_position = MAGIC_BYTES.len() as u64;
+        
+        Ok(())
+    }
+}
+
+impl<'a> Read for BlockDataReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Position the reader at the current position if needed
+        let current_pos = self.reader.stream_position()?;
+        if current_pos != self.current_position {
+            self.reader.seek(SeekFrom::Start(self.current_position))?;
+        }
+        
+        let mut bytes_read = self.reader.read(buf)?;
+        
+        // Update position
+        self.current_position += bytes_read as u64;
+        
+        // If we've reached the end of the file, try moving to the next file
+        if bytes_read == 0 {
+            match self.move_to_next_file() {
+                Ok(_) => {
+                    // Try reading from the new file
+                    let additional = self.read(&mut buf[bytes_read..])?;
+                    bytes_read += additional;
+                }
+                Err(_) => {
+                    // End of all files reached, return 0 bytes read
+                    return Ok(0);
+                }
+            }
+        }
+        
+        Ok(bytes_read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::io::Read;
+    use rand::{Rng, thread_rng};
+    use super::super::block_data::TWEAK_SIZE;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let mut dir = env::temp_dir();
+        dir.push(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn create_random_block_data() -> BlockData {
+        let mut rng = thread_rng();
+        let mut blockhash = [0u8; 32];
+        for i in 0..32 {
+            blockhash[i] = rng.gen();
+        }
+        
+        let num_tweaks = rng.gen_range(1..10);
+        let mut tweaks = Vec::with_capacity(num_tweaks);
+        
+        for _ in 0..num_tweaks {
+            let mut tweak = [0u8; TWEAK_SIZE];
+            for i in 0..TWEAK_SIZE {
+                tweak[i] = rng.gen();
+            }
+            tweaks.push(tweak);
+        }
+        
+        BlockData { blockhash, tweaks }
+    }
+
+    #[test]
+    fn test_add_and_read_single_block() {
+        let test_dir = temp_dir("test_flat_file_store_single");
+        let test_dir_str = test_dir.to_str().unwrap();
+        
+        // Initialize store
+        let mut store = FlatFileStore::initialize(test_dir_str).unwrap();
+        
+        // Create and add a block
+        let block = create_random_block_data();
+        let height = 0;
+        store.add_block(&block, height).unwrap();
+        
+        // Read the block back
+        let mut reader = store.get_block_stream_from_height(height).unwrap();
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).unwrap();
+        
+        // Deserialize and verify
+        let read_block = BlockData::deserialize(&buffer).unwrap();
+        assert_eq!(block.blockhash, read_block.blockhash);
+        assert_eq!(block.tweaks, read_block.tweaks);
+        
+        // Clean up
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_add_and_read_multiple_blocks() {
+        let test_dir = temp_dir("test_flat_file_store_multiple");
+        let test_dir_str = test_dir.to_str().unwrap();
+        
+        // Initialize store
+        let mut store = FlatFileStore::initialize(test_dir_str).unwrap();
+        
+        // Create and add multiple blocks
+        let num_blocks = 10;
+        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut heights = Vec::with_capacity(num_blocks);
+        
+        for i in 0..num_blocks {
+            let block = create_random_block_data();
+            blocks.push(block);
+            heights.push(i as u32);
+        }
+        
+        store.add_block_bulk(&blocks, &heights).unwrap();
+        
+        // Read and verify each block
+        for (i, original_block) in blocks.iter().enumerate() {
+            let height = i as u32;
+            let mut reader = store.get_block_stream_from_height(height).unwrap();
+            let mut buffer = Vec::new();
+            reader.read_to_end(&mut buffer).unwrap();
+            
+            let read_block = BlockData::deserialize(&buffer).unwrap();
+            assert_eq!(original_block.blockhash, read_block.blockhash);
+            assert_eq!(original_block.tweaks, read_block.tweaks);
+        }
+        
+        // Clean up
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_cross_file_boundary() {
+        let test_dir = temp_dir("test_flat_file_store_boundary");
+        let test_dir_str = test_dir.to_str().unwrap();
+        
+        // Initialize store
+        let mut store = FlatFileStore::initialize(test_dir_str).unwrap();
+        
+        // Create a large block with many tweaks to make it bigger
+        let mut large_block = create_random_block_data();
+        let mut rng = thread_rng();
+        for _ in 0..100 {
+            let mut tweak = [0u8; TWEAK_SIZE];
+            for i in 0..TWEAK_SIZE {
+                tweak[i] = rng.gen();
+            }
+            large_block.tweaks.push(tweak);
+        }
+        
+        // Add the block 10,000 times
+        for height in 0..10_000 {
+            store.add_block(&large_block, height).unwrap();
+        }
+        
+        
+        // Test reading beyond the end of a file
+        let mut reader = store.get_block_stream_from_height(0).unwrap();
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).unwrap();
+        
+        // The buffer should contain all blocks concatenated
+        let mut pos = 0;
+        while pos < buffer.len() {
+            let block = BlockData::deserialize(&buffer[pos..]).unwrap();
+            assert_eq!(large_block.blockhash, block.blockhash);
+            assert_eq!(large_block.tweaks.len(), block.tweaks.len());
+            pos += block.serialize().len();
+        }
+        
+        // Clean up
+        let _ = fs::remove_dir_all(test_dir);
     }
 }

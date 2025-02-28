@@ -150,8 +150,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::env;
-    use std::time::Instant;
-    use rand::{Rng, thread_rng};
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut dir = env::temp_dir();
@@ -329,7 +327,7 @@ mod tests {
         drop(index1);
 
         // Reopen existing
-        let (index2, was_created2) = Index::initialize(&index_dir).unwrap();
+        let (_, was_created2) = Index::initialize(&index_dir).unwrap();
         assert!(!was_created2, "Second initialization should open existing database");
         
         let _ = fs::remove_dir_all(index_dir);
