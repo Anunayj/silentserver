@@ -1,49 +1,82 @@
+mod logging;
 mod storage;
 
-use bitcoinkernel::{
-    ChainType, ChainstateManager, ChainstateManagerOptions, ContextBuilder, KernelError,
-    Log, Logger,
-};
-use std::sync::Arc;
-use env_logger::Builder;
-use log::LevelFilter;
+use clap::{Parser, ValueEnum};
 
+use std::path::PathBuf;
 use storage::FlatFileStore;
 
-struct MainLog {}
+use env_logger::Env;
+use log::info;
+use logging::setup_logging;
 
-impl Log for MainLog {
-    fn log(&self, message: &str) {
-        log::info!(
-            target: "libbitcoinkernel", 
-            "{}", message.strip_suffix("\r\n").or_else(|| message.strip_suffix('\n')).unwrap_or(message));
+#[derive(Debug, Clone, ValueEnum)]
+enum Network {
+    Mainnet,
+    Testnet,
+    Signet,
+    Regtest,
+}
+
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Network::Mainnet => write!(f, "mainnet"),
+            Network::Testnet => write!(f, "testnet"),
+            Network::Signet => write!(f, "signet"),
+            Network::Regtest => write!(f, "regtest"),
+        }
     }
 }
 
-fn setup_logging() -> Result<Logger<MainLog>, KernelError> {
-    let mut builder = Builder::from_default_env();
-    builder.filter(None, LevelFilter::Info).init();
-    Logger::new(MainLog {})
+impl Network {
+    fn get_dirname(&self) -> &'static str {
+        match self {
+            Network::Mainnet => "", // Mainnet is stored in base directory, never liked this
+            Network::Testnet => "testnet3",
+            Network::Signet => "signet",
+            Network::Regtest => "regtest",
+        }
+    }
 }
 
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Directory where Silent Payment Server data will be stored
+    #[arg(short, long)]
+    data_dir: PathBuf,
 
-fn main() { 
-    let _ = setup_logging().unwrap();
-    // Initialize context with signet chain type and specific signet challenge
-    let context = Arc::new(
-        ContextBuilder::new()
-            .chain_type(ChainType::REGTEST)
-            .build()
-            .unwrap(),
-    );
-    // Create ChainstateManagerOptions with the specified directories
-    let options: ChainstateManagerOptions = ChainstateManagerOptions::new(&context, "/mnt/d/bitcoin_data/regtest", "/mnt/d/bitcoin_data/regtest/blocks").unwrap();
-    // Create ChainstateManager
-    let chainman = ChainstateManager::new(options, Arc::clone(&context)).unwrap();
-    // chainman.import_blocks().unwrap();
-    // Automatically fetch and process new blocks
-    let mut tip_index = chainman.get_block_index_tip();
-    // chainman.read_undo_data(block_index);
-    dbg!(tip_index.height());
-    
+    /// Bitcoin data directory (defaults to ~/.bitcoin)
+    #[arg(short, long, default_value_os_t = default_bitcoin_dir())]
+    bitcoin_datadir: PathBuf,
+
+    /// Bitcoin network type
+    #[arg(short, long, default_value_t = Network::Mainnet)]
+    network: Network,
+}
+
+fn default_bitcoin_dir() -> PathBuf {
+    dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join(".bitcoin")
+}
+
+fn join_network_dir(base: impl Into<PathBuf>, network: &Network) -> PathBuf {
+    base.into().join(network.get_dirname())
+}
+
+fn main() {
+    let args = Args::parse();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
+    setup_logging().expect("Failed to setup logging");
+
+    let data_dir = join_network_dir(args.data_dir, &args.network);
+    let store = FlatFileStore::initialize(data_dir).expect("Failed to initialize storage");
+
+    let chain_dir = join_network_dir(&args.bitcoin_datadir, &args.network);
+    info!("Using Bitcoin data directory: {}", chain_dir.display());
+
+    // TODO: Initialize the kernel, read the chain state, sync it, etc.
 }
