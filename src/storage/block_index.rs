@@ -44,7 +44,6 @@ pub struct Index {
     /// Maps blockhash -> IndexEntry
     index_db: Db,
 
-    
     /// Maps height <-> blockhash
     // This HAS to be stupid, but idc.
     // Height -> Hash is probably sensible,
@@ -52,6 +51,7 @@ pub struct Index {
     // TODO: Fix this shit.
     height_to_hash: sled::Tree,
     hash_to_height: sled::Tree,
+    next_height: u32,
 }
 
 impl Index {
@@ -60,16 +60,35 @@ impl Index {
         let index_db = sled::open(db_path)?;
         let height_to_hash = index_db.open_tree("height_to_hash")?;
         let hash_to_height = index_db.open_tree("hash_to_height")?;
-        
+
         // was_recovered() returns true if the database was recovered from a previous instance
-        // so we negate it to get whether it's a new database
         let is_new = !index_db.was_recovered();
-        
-        Ok((Index {
-            index_db,
-            height_to_hash,
-            hash_to_height,
-        }, is_new))
+
+        let next_height = if is_new {
+            0
+        } else {
+            let data = height_to_hash.last()?;
+
+            if let Some((height, _)) = data {
+                let height_bytes: [u8; 4] = height
+                    .as_ref()
+                    .try_into()
+                    .expect("IndexDb corrupted, height is not 4 bytes");
+                u32::from_le_bytes(height_bytes) + 1
+            } else {
+                0
+            }
+        };
+
+        Ok((
+            Index {
+                index_db,
+                height_to_hash,
+                hash_to_height,
+                next_height,
+            },
+            is_new,
+        ))
     }
 
     pub fn insert_block(
@@ -78,11 +97,23 @@ impl Index {
         blockhash: &[u8; 32],
         entry: &IndexEntry,
     ) -> Result<(), StorageError> {
-        self.height_to_hash
-            .insert(&height.to_le_bytes(), blockhash)?;
-        self.hash_to_height
-            .insert(blockhash, &height.to_le_bytes())?;
-        self.index_db.insert(blockhash, &entry.serialize())?;
+        if height != self.next_height {
+            return Err(StorageError::InvalidHeight);
+        }
+        // TODO: Make this "atomic".
+        {
+            self.height_to_hash
+                .insert(&height.to_le_bytes(), blockhash)?;
+            self.next_height += 1;
+
+            // these panic on failure for now.
+            self.hash_to_height
+                .insert(blockhash, &height.to_le_bytes())
+                .expect("Failed to insert hash to height");
+            self.index_db
+                .insert(blockhash, &entry.serialize())
+                .expect("Failed to insert blockhash to index");
+        }
         Ok(())
     }
 
@@ -135,21 +166,35 @@ impl Index {
         }
 
         if let Ok(height) = self.get_height_by_blockhash(blockhash) {
+            if height != self.next_height - 1 {
+                // TODO: Technically, we should allow removing a deeper block and remove
+                // all blocks in the chain leading from it.
+                // This is a safeguard for now.
+                return Err(StorageError::InvalidHeight); // Remove block should only attempt to remove tip
+            }
+            self.next_height -= 1;
             self.height_to_hash.remove(&height.to_le_bytes())?;
             self.hash_to_height.remove(blockhash)?;
-        }
+            // Mark the entry as orphaned with a special zero value
+            self.index_db.insert(blockhash, &[0u8; 1])?;
 
-        // Mark the entry as orphaned with a special zero value
-        self.index_db.insert(blockhash, &[0u8; 1])?;
-        Ok(())
+            Ok(())
+        } else {
+            Err(StorageError::EntryNotFound)
+        }
+    }
+    /// Returns the height of chain
+    /// returns -1 if the chain is empty
+    pub fn get_current_height(&self) -> i32 {
+        self.next_height as i32 - 1
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::env;
+    use std::fs;
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut dir = env::temp_dir();
@@ -163,9 +208,12 @@ mod tests {
     fn test_index_operations() {
         let index_dir = temp_dir("test_block_index");
         let (mut index, was_created) = Index::initialize(&index_dir).unwrap();
-        assert!(was_created, "First initialization should create new database");
+        assert!(
+            was_created,
+            "First initialization should create new database"
+        );
 
-        let height = 12345u32;
+        let height = 0u32;
         let blockhash = [42u8; 32];
         let entry = IndexEntry {
             file_number: 1,
@@ -219,10 +267,9 @@ mod tests {
         let (mut index, _) = Index::initialize(&index_dir).unwrap();
 
         // Insert multiple blocks
-        for i in 0..1000 {
+        for i in 0..256 {
             let height = i;
-            let mut blockhash = [0u8; 32];
-            blockhash[0] = i as u8;
+            let blockhash: [u8; 32] = [i as u8; 32];
             let entry = IndexEntry {
                 file_number: i as u64,
                 offset: i as u64 * 1000,
@@ -232,10 +279,9 @@ mod tests {
         }
 
         // Verify all blocks
-        for i in 0..1000 {
+        for i in 0..256 {
             let height = i;
-            let mut expected_blockhash = [0u8; 32];
-            expected_blockhash[0] = i as u8;
+            let expected_blockhash = [i as u8; 32];
             let expected_entry = IndexEntry {
                 file_number: i as u64,
                 offset: i as u64 * 1000,
@@ -265,7 +311,7 @@ mod tests {
         let (mut index, _) = Index::initialize(&index_dir).unwrap();
 
         // Insert a block
-        let height = 12345u32;
+        let height = 0u32;
         let blockhash = [42u8; 32];
         let entry = IndexEntry {
             file_number: 1,
@@ -306,7 +352,7 @@ mod tests {
         let (mut index, _) = Index::initialize(&index_dir).unwrap();
 
         let nonexistent_blockhash = [0u8; 32];
-        
+
         // Attempting to mark non-existent block as orphaned should fail
         assert!(matches!(
             index.remove_block(&nonexistent_blockhash),
@@ -320,19 +366,22 @@ mod tests {
     #[test]
     fn test_reopen_existing_db() {
         let index_dir = temp_dir("test_reopen_db");
-        
+
         // First creation
         let (index1, was_created1) = Index::initialize(&index_dir).unwrap();
-        assert!(was_created1, "First initialization should create new database");
+        assert!(
+            was_created1,
+            "First initialization should create new database"
+        );
         drop(index1);
 
         // Reopen existing
         let (_, was_created2) = Index::initialize(&index_dir).unwrap();
-        assert!(!was_created2, "Second initialization should open existing database");
-        
+        assert!(
+            !was_created2,
+            "Second initialization should open existing database"
+        );
+
         let _ = fs::remove_dir_all(index_dir);
     }
 }
-
-
-

@@ -71,6 +71,7 @@ impl BlockData {
         let mut hasher = Hasher::new();
         hasher.update(tweaks_data);
         let crc_computed = hasher.finalize();
+        
         if crc_computed != crc_stored {
             return Err(StorageError::CrcMismatch);
         }

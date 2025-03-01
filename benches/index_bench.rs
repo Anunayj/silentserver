@@ -44,9 +44,8 @@ fn bench_index_operations(c: &mut Criterion) {
         
         let mut i = 0;
         b.iter(|| {
-            black_box(index.insert_block(i as u32, &blockhashes[i], &entries[i]).unwrap());
+            black_box(index.insert_block(i as u32, &blockhashes[i % MAX_HEIGHT], &entries[i % MAX_HEIGHT]).unwrap());
             i += 1;
-            i %= MAX_HEIGHT;
         });
         
         let _ = fs::remove_dir_all(index_dir);
@@ -76,9 +75,8 @@ fn bench_index_operations(c: &mut Criterion) {
 
         let mut i = 0;
         b.iter(|| {
-            black_box(index.get_block_entry(&blockhashes[i]).unwrap());
+            black_box(index.get_block_entry(&blockhashes[i % MAX_HEIGHT]).unwrap());
             i += 1;
-            i %= MAX_HEIGHT;
         });
 
         // Cleanup

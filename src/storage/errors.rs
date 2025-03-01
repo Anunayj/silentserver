@@ -10,6 +10,10 @@ pub enum StorageError {
     DbError(sled::Error),
     EntryNotFound,
     OrphanedEntry,
+    // This is here just as a safeguard. In reality I 
+    // could probably imply that a new block to be added
+    InvalidHeight, 
+    CorruptDB(&'static str),
 }
 
 impl From<io::Error> for StorageError {
@@ -34,8 +38,10 @@ impl std::fmt::Display for StorageError {
             StorageError::DbError(e) => write!(f, "Database error: {}", e),
             StorageError::EntryNotFound => write!(f, "Not found"),
             StorageError::OrphanedEntry => write!(f, "Entry is marked as orphaned"),
+            StorageError::InvalidHeight => write!(f, "Invalid height"),
+            StorageError::CorruptDB(msg) => write!(f, "Corrupt database: {}", msg),
         }
     }
 }
 
-impl std::error::Error for StorageError {} 
+impl std::error::Error for StorageError {}
