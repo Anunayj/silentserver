@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rand::{Rng, thread_rng};
+use rand::prelude::*;
 use silentserver::storage::{Index, IndexEntry};
 use std::env;
 use std::fs;
@@ -26,7 +26,7 @@ fn bench_index_operations(c: &mut Criterion) {
         let (mut index, _) = Index::initialize(&index_dir).unwrap();
         
         // Pre-generate all the test data
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         let mut blockhashes = Vec::with_capacity(MAX_HEIGHT);
         let mut entries = Vec::with_capacity(MAX_HEIGHT);
         
@@ -57,7 +57,7 @@ fn bench_index_operations(c: &mut Criterion) {
         let (mut index, _) = Index::initialize(&index_dir).unwrap();
         
         // Pre-generate test data and insert it
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         let mut blockhashes = Vec::with_capacity(MAX_HEIGHT);
         
         for height in 0..MAX_HEIGHT as u32 {

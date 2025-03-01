@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -278,7 +278,7 @@ impl<'a> Read for BlockDataReader<'a> {
 mod tests {
     use super::super::block_data::TWEAK_SIZE;
     use super::*;
-    use rand::{thread_rng, Rng};
+    use rand::Rng;
     use std::env;
     use std::fs;
     use std::io::Read;
@@ -292,19 +292,19 @@ mod tests {
     }
 
     fn create_random_block_data() -> BlockData {
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         let mut blockhash = [0u8; 32];
         for i in 0..32 {
-            blockhash[i] = rng.gen();
+            blockhash[i] = rng.random();
         }
 
-        let num_tweaks = rng.gen_range(1..10);
+        let num_tweaks = rng.random_range(1..10);
         let mut tweaks = Vec::with_capacity(num_tweaks);
 
         for _ in 0..num_tweaks {
             let mut tweak = [0u8; TWEAK_SIZE];
             for i in 0..TWEAK_SIZE {
-                tweak[i] = rng.gen();
+                tweak[i] = rng.random();
             }
             tweaks.push(tweak);
         }
@@ -382,11 +382,11 @@ mod tests {
 
         // Create a large block with many tweaks to make it bigger
         let mut large_block = create_random_block_data();
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..100 {
             let mut tweak = [0u8; TWEAK_SIZE];
             for i in 0..TWEAK_SIZE {
-                tweak[i] = rng.gen();
+                tweak[i] = rng.random();
             }
             large_block.tweaks.push(tweak);
         }
